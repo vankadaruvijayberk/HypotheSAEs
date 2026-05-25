@@ -398,15 +398,29 @@ class NeuronInterpreter:
         if not (1 in labels and 0 in labels):
             return {"recall": 0.0, "precision": 0.0, "f1": 0.0, "correlation": 0.0}
             
-        true_pos = np.mean(annotations[labels == 1])
-        false_pos = np.mean(annotations[labels == 0])
-        precision = 1 - false_pos
-        
-        f1 = 2 * true_pos * precision / (true_pos + precision) if (true_pos + precision) > 0 else 0.0
+        annotations = np.asarray(annotations).astype(bool)
+        labels = np.asarray(labels).astype(bool)
+
+        true_positives = np.sum(annotations & labels)
+        false_positives = np.sum(annotations & ~labels)
+        false_negatives = np.sum(~annotations & labels)
+
+        recall = (
+            true_positives / (true_positives + false_negatives)
+            if (true_positives + false_negatives) > 0
+            else 0.0
+        )
+        precision = (
+            true_positives / (true_positives + false_positives)
+            if (true_positives + false_positives) > 0
+            else 0.0
+        )
+
+        f1 = 2 * recall * precision / (recall + precision) if (recall + precision) > 0 else 0.0
         correlation = np.corrcoef(activations, annotations)[0,1] if len(np.unique(annotations)) > 1 else 0.0
         
         return {
-            "recall": true_pos,
+            "recall": recall,
             "precision": precision,
             "f1": f1,
             "correlation": correlation
