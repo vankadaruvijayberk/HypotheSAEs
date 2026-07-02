@@ -4,6 +4,11 @@ New version releases for HypotheSAEs will be documented here.
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-07-02
+
+### Fixed
+- Fixed interpretation precision metric computation.
+
 ## [2.0.0] - 2026-03-08
 
 ### Changed
