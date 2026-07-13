@@ -210,6 +210,7 @@ def get_local_embeddings(
     show_progress: bool = True,
     cache_name: Optional[str] = None,
     chunk_size: int = 50000,
+    nomic_prefix: str = "classification: ",
     device: Optional[torch.device] = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ) -> Dict[str, np.ndarray]:
     """Get embeddings using local SentenceTransformer model with chunked caching."""
@@ -255,7 +256,7 @@ def get_local_embeddings(
         for i in batch_iterator:
             batch = chunk_texts[i:i+batch_size]
             if "nomic-ai" in model:
-                prefixed_batch = ["clustering: " + text for text in batch]
+                prefixed_batch = [nomic_prefix + text for text in batch]
             elif "instructor" in model:
                 prefixed_batch = [["Represent the text for classification: ", text] for text in batch]
             else:

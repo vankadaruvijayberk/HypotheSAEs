@@ -202,9 +202,34 @@ def get_completion(
 
     request_input = messages if messages is not None else prompt
 
+    # Route non-OpenAI endpoints (vLLM, ollama, llama.cpp) through Chat Completions;
+    # those servers do not reliably implement the Responses API. Override with OPENAI_API_MODE.
+    use_chat = not _uses_openai_auth(os.environ.get("OPENAI_BASE_URL"))
+    _api_mode = os.environ.get("OPENAI_API_MODE")
+    if _api_mode:
+        use_chat = (_api_mode == "chat")
+
     base_wait = timeout if timeout is not None else 1.0
     for attempt in range(max_retries):
         try:
+            if use_chat:
+                messages_input = (
+                    request_input if isinstance(request_input, list)
+                    else [{"role": "user", "content": request_input}]
+                )
+                # Whitelist chat-safe fields only; never forward Responses-only kwargs.
+                chat_kwargs = {k: kwargs[k] for k in ("temperature", "top_p", "stop", "extra_body") if k in kwargs}
+                if max_output_tokens is not None:
+                    chat_kwargs["max_tokens"] = max_output_tokens
+                if timeout is not None:
+                    chat_kwargs["timeout"] = timeout
+                response = client.chat.completions.create(
+                    model=model_id,
+                    messages=messages_input,
+                    **chat_kwargs
+                )
+                return response.choices[0].message.content or ""
+
             request_kwargs = dict(kwargs)
             if max_output_tokens is not None:
                 request_kwargs["max_output_tokens"] = max_output_tokens
@@ -217,7 +242,7 @@ def get_completion(
                 **request_kwargs
             )
             return _extract_output_text(response)
-            
+
         except (openai.RateLimitError, openai.APITimeoutError) as e:
             if attempt == max_retries - 1:  # Last attempt
                 raise e
