@@ -95,6 +95,83 @@ def redirect_annotation_cache():
     _i.CACHE_DIR = ANNOT_DIR
 
 
+def _log_tail(path, n=40):
+    try:
+        return "\n".join(open(path).read().splitlines()[-n:])
+    except Exception:
+        return "(no log)"
+
+
+def gpu_free_gb():
+    import subprocess
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.free",
+                              "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True).stdout.strip().splitlines()[0]
+        return round(float(out) / 1024, 1)
+    except Exception:
+        return float("nan")
+
+
+def kill_stray_vllm(wait_s=12):
+    """Kill leftover vLLM servers so a retry cannot OOM against its own zombie."""
+    import subprocess, time
+    for pat in ("vllm serve", "vllm.entrypoints"):
+        subprocess.run(["pkill", "-9", "-f", pat], capture_output=True)
+    time.sleep(wait_s)
+    clear_mem()
+
+
+def stop_vllm(proc=None):
+    if proc is not None:
+        try:
+            proc.terminate(); proc.wait(timeout=30)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    kill_stray_vllm(wait_s=5)
+
+
+def serve_vllm(model, port=8000, max_model_len=8192, gpu_frac=0.85,
+               wait_s=900, enforce_eager=False):
+    """Start a vLLM OpenAI server; raise immediately with the log tail if it dies."""
+    import subprocess, sys, shutil, time, requests
+    kill_stray_vllm()
+    log_path = "/content/vllm_%d.log" % port
+    exe = shutil.which("vllm")
+    cmd = ([exe, "serve", model] if exe else
+           [sys.executable, "-m", "vllm.entrypoints.openai.api_server", "--model", model])
+    cmd += ["--port", str(port), "--max-model-len", str(max_model_len),
+            "--gpu-memory-utilization", str(gpu_frac)]
+    if enforce_eager:
+        cmd += ["--enforce-eager"]
+    print("serving %s (free VRAM %s GB), log: %s" % (model, gpu_free_gb(), log_path))
+    log = open(log_path, "w")
+    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
+    base = "http://127.0.0.1:%d/v1" % port
+    deadline = time.time() + wait_s
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            log.close()
+            raise RuntimeError("vLLM exited (code %s) serving %s\nfree VRAM %s GB\n--- log ---\n%s"
+                               % (proc.returncode, model, gpu_free_gb(), _log_tail(log_path)))
+        try:
+            if requests.get(base + "/models", timeout=2).status_code == 200:
+                os.environ["OPENAI_BASE_URL"] = base
+                os.environ.setdefault("OPENAI_API_KEY", "EMPTY")
+                print("server up:", base)
+                return proc
+        except Exception:
+            pass
+        time.sleep(5)
+    stop_vllm(proc)
+    log.close()
+    raise RuntimeError("vLLM timed out after %ss serving %s\n--- log ---\n%s"
+                       % (wait_s, model, _log_tail(log_path)))
+
+
 def load_goemotions():
     from datasets import load_dataset
     ds = load_dataset("google-research-datasets/go_emotions", "simplified")
