@@ -95,11 +95,28 @@ def redirect_annotation_cache():
     _i.CACHE_DIR = ANNOT_DIR
 
 
-def _log_tail(path, n=40):
+# ---------------------------------------------------------------- serving
+
+def _log_digest(path, tail_n=25):
+    """Error lines first, then the tail. A bare tail usually shows only cleanup noise."""
+    import re
     try:
-        return "\n".join(open(path).read().splitlines()[-n:])
+        lines = open(path).read().splitlines()
     except Exception:
         return "(no log)"
+    pat = r"error|denied|401|403|gated|unauthorized|Traceback|Exception|OSError|No such file|not found"
+    errs = [l for l in lines if re.search(pat, l, re.I)]
+    out = []
+    if errs:
+        out.append("--- error lines ---")
+        out.extend(errs[:25])
+    out.append("--- tail ---")
+    out.extend(lines[-tail_n:])
+    return "\n".join(out)
+
+
+def dump_log(port=8001):
+    print(_log_digest("/content/vllm_%d.log" % port, tail_n=40))
 
 
 def gpu_free_gb():
@@ -111,6 +128,27 @@ def gpu_free_gb():
         return round(float(out) / 1024, 1)
     except Exception:
         return float("nan")
+
+
+def fix_cuda_libs(verbose=True):
+    """vLLM wheels link a specific CUDA major (e.g. libcudart.so.13). If only the
+    cu12 runtime is present the C extension fails to import and the server dies."""
+    import glob, sysconfig, subprocess
+    sp = sysconfig.get_paths()["purelib"]
+    pat = os.path.join(sp, "nvidia", "**", "lib")
+    if not glob.glob(os.path.join(pat, "libcudart.so.13*"), recursive=True):
+        subprocess.run(["pip", "install", "-q", "-U", "nvidia-cuda-runtime-cu13"],
+                       capture_output=True)
+    dirs = sorted({os.path.dirname(p)
+                   for p in glob.glob(os.path.join(pat, "*.so*"), recursive=True)})
+    if dirs:
+        os.environ["LD_LIBRARY_PATH"] = ":".join(
+            dirs + [os.environ.get("LD_LIBRARY_PATH", "")]).strip(":")
+    if verbose:
+        hits = glob.glob(os.path.join(pat, "libcudart.so.*"), recursive=True)
+        print("cudart:", sorted({os.path.basename(h) for h in hits}) or "NONE",
+              "| nvidia lib dirs:", len(dirs))
+    return dirs
 
 
 def kill_stray_vllm(wait_s=12):
@@ -136,8 +174,9 @@ def stop_vllm(proc=None):
 
 def serve_vllm(model, port=8000, max_model_len=8192, gpu_frac=0.85,
                wait_s=900, enforce_eager=False):
-    """Start a vLLM OpenAI server; raise immediately with the log tail if it dies."""
+    """Start a vLLM OpenAI server; raise immediately with a log digest if it dies."""
     import subprocess, sys, shutil, time, requests
+    fix_cuda_libs()
     kill_stray_vllm()
     log_path = "/content/vllm_%d.log" % port
     exe = shutil.which("vllm")
@@ -147,7 +186,7 @@ def serve_vllm(model, port=8000, max_model_len=8192, gpu_frac=0.85,
             "--gpu-memory-utilization", str(gpu_frac)]
     if enforce_eager:
         cmd += ["--enforce-eager"]
-    print("serving %s (free VRAM %s GB), log: %s" % (model, gpu_free_gb(), log_path))
+    print("serving %s (free VRAM %s GB) log: %s" % (model, gpu_free_gb(), log_path))
     log = open(log_path, "w")
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
     base = "http://127.0.0.1:%d/v1" % port
@@ -155,8 +194,8 @@ def serve_vllm(model, port=8000, max_model_len=8192, gpu_frac=0.85,
     while time.time() < deadline:
         if proc.poll() is not None:
             log.close()
-            raise RuntimeError("vLLM exited (code %s) serving %s\nfree VRAM %s GB\n--- log ---\n%s"
-                               % (proc.returncode, model, gpu_free_gb(), _log_tail(log_path)))
+            raise RuntimeError("vLLM exited (code %s) serving %s | free VRAM %s GB\n%s"
+                               % (proc.returncode, model, gpu_free_gb(), _log_digest(log_path)))
         try:
             if requests.get(base + "/models", timeout=2).status_code == 200:
                 os.environ["OPENAI_BASE_URL"] = base
@@ -168,8 +207,51 @@ def serve_vllm(model, port=8000, max_model_len=8192, gpu_frac=0.85,
         time.sleep(5)
     stop_vllm(proc)
     log.close()
-    raise RuntimeError("vLLM timed out after %ss serving %s\n--- log ---\n%s"
-                       % (wait_s, model, _log_tail(log_path)))
+    raise RuntimeError("vLLM timed out after %ss serving %s\n%s"
+                       % (wait_s, model, _log_digest(log_path)))
+
+
+# ---------------------------------------------------------------- analysis
+
+def annotation_cache_missing(cache_name, concepts, texts):
+    """Count (concept, text) pairs not yet cached, so a fully cached model can skip serving."""
+    from hypothesaes.annotate import get_annotation_cache, generate_cache_key
+    path = os.path.join(ANNOT_DIR, "%s_hypothesis-eval.json" % cache_name)
+    if not os.path.exists(path):
+        return len(concepts) * len(texts)
+    cache = get_annotation_cache(path)
+    return sum(1 for c in concepts for t in texts
+               if generate_cache_key(c, t) not in cache)
+
+
+def score_hypotheses_stable(hyp_ann, y_true, classification=True, corrected_pval_threshold=0.1):
+    """score_hypotheses with degenerate columns removed.
+
+    A hypothesis the annotator never (or always) fires on is constant, which is
+    collinear with the intercept: the Logit design matrix goes singular, the fit
+    falls back to OLS and R^2 can come back inf/NaN. Such a hypothesis carries no
+    information on this heldout set by construction, so drop it and report it.
+    Returns (metrics, df, dropped).
+    """
+    from hypothesaes.evaluation import score_hypotheses
+    kept, dropped, seen = {}, [], {}
+    for h, a in hyp_ann.items():
+        a = np.asarray(a)
+        if a.std() == 0:
+            dropped.append({"hypothesis": h, "reason": "zero_variance",
+                            "prevalence": float(a.mean())})
+            continue
+        key = a.tobytes()
+        if key in seen:
+            dropped.append({"hypothesis": h, "reason": "duplicate", "of": seen[key]})
+            continue
+        seen[key] = h
+        kept[h] = a
+    if len(kept) < 2:
+        return None, None, dropped
+    m, df = score_hypotheses(kept, y_true=y_true, classification=classification,
+                             corrected_pval_threshold=corrected_pval_threshold)
+    return m, df, dropped
 
 
 def load_goemotions():
