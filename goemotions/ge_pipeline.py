@@ -95,8 +95,6 @@ def redirect_annotation_cache():
     _i.CACHE_DIR = ANNOT_DIR
 
 
-# ---------------------------------------------------------------- serving
-
 def _log_digest(path, tail_n=25):
     """Error lines first, then the tail. A bare tail usually shows only cleanup noise."""
     import re
@@ -210,8 +208,6 @@ def serve_vllm(model, port=8000, max_model_len=8192, gpu_frac=0.85,
     raise RuntimeError("vLLM timed out after %ss serving %s\n%s"
                        % (wait_s, model, _log_digest(log_path)))
 
-
-# ---------------------------------------------------------------- analysis
 
 def annotation_cache_missing(cache_name, concepts, texts):
     """Count (concept, text) pairs not yet cached, so a fully cached model can skip serving."""
